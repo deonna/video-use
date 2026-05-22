@@ -58,6 +58,20 @@ PRESETS: dict[str, str] = {
         "curves=master='0/0 0.25/0.22 0.75/0.78 1/1'"
     ),
 
+    # Airy / less-yellow preset. Lifts brightness, gentle contrast, vibrant color
+    # (saturation 1.05 = slightly punchy without going neon). Neutralizes yellow
+    # by reducing red+green and adding blue across shadows/mids/highlights.
+    # Contrast bumped to 1.08 to make on-screen text more legible during laptop
+    # close-ups without over-cooking face shots.
+    "airy": (
+        "eq=contrast=1.08:brightness=0.04:saturation=1.05,"
+        "colorbalance="
+        "rs=-0.03:gs=-0.02:bs=0.04:"
+        "rm=-0.02:gm=-0.01:bm=0.03:"
+        "rh=-0.05:gh=-0.02:bh=0.06,"
+        "curves=master='0/0 0.25/0.27 0.75/0.78 1/1'"
+    ),
+
     # Flat — no grade. Useful as a sentinel for "skip grading this source".
     "none": "",
 }
