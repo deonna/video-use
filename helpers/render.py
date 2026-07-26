@@ -146,6 +146,27 @@ def is_portrait_source(video: Path) -> bool:
         return False
 
 
+def source_fps(video: Path, default: float = 30.0) -> float:
+    """Return the source's frame rate as a float (e.g. 30.0, 59.94).
+
+    Resampling to a fixed rate that doesn't divide evenly into the source
+    (30→24, 60→30) drops frames unevenly and reads as judder. We probe the
+    source rate and keep segments at it so the deliverable never resamples.
+    """
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=r_frame_rate",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(video)],
+            capture_output=True, text=True, check=True,
+        )
+        num, _, den = out.stdout.strip().partition("/")
+        fps = float(num) / float(den) if den else float(num)
+        return fps if fps > 0 else default
+    except Exception:
+        return default
+
+
 # -------- Per-segment extraction (Rule 2 + Rule 3) --------------------------
 
 
@@ -160,26 +181,34 @@ def extract_segment(
 ) -> None:
     """Extract a cut range as its own MP4 with grade + 30ms audio fades baked in.
 
-    `-ss` before `-i` for fast accurate seeking. Scale to 1080p from 4K.
-    Portrait sources (height > width) are scaled by height to preserve orientation.
+    `-ss` before `-i` for fast accurate seeking. Frame rate is matched to the
+    source so the deliverable never resamples (the cause of judder).
 
     Quality ladder:
-      - final (default): 1080p libx264 fast CRF 20
+      - final (default): NATIVE resolution (no downscale), libx264 medium CRF 16
+                         (near-transparent intermediate; the final composite then
+                         re-encodes once at CRF 17 slow → visually lossless overall)
       - preview:         1080p libx264 medium CRF 22 (evaluable for QC)
       - draft:           720p libx264 ultrafast CRF 28 (cut-point check only)
+
+    Preview/draft are QC-only and downscale for speed; they must never be the
+    deliverable. Final preserves the source resolution exactly.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     portrait = is_portrait_source(source)
     if draft:
         scale = "scale=-2:1280" if portrait else "scale=1280:-2"
-    else:
+    elif preview:
         scale = "scale=-2:1920" if portrait else "scale=1920:-2"
+    else:
+        scale = None  # final: preserve native source resolution
 
     vf_parts: list[str] = []
     if is_hdr_source(source):
         vf_parts.append(TONEMAP_CHAIN)
-    vf_parts.append(scale)
+    if scale:
+        vf_parts.append(scale)
     if grade_filter:
         vf_parts.append(grade_filter)
     vf = ",".join(vf_parts)
@@ -193,17 +222,22 @@ def extract_segment(
     elif preview:
         preset, crf = "medium", "22"
     else:
-        preset, crf = "fast", "20"
+        preset, crf = "medium", "16"
+
+    fps = source_fps(source)
 
     cmd = [
         "ffmpeg", "-y",
         "-ss", f"{seg_start:.3f}",
         "-i", str(source),
         "-t", f"{duration:.3f}",
-        "-vf", vf,
+    ]
+    if vf:
+        cmd += ["-vf", vf]
+    cmd += [
         "-af", af,
         "-c:v", "libx264", "-preset", preset, "-crf", crf,
-        "-pix_fmt", "yuv420p", "-r", "30",
+        "-pix_fmt", "yuv420p", "-r", f"{fps:.6g}",
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
         "-movflags", "+faststart",
         str(out_path),
@@ -265,22 +299,68 @@ def extract_all_segments(
 
 
 def concat_segments(segment_paths: list[Path], out_path: Path, edit_dir: Path) -> None:
-    """Lossless concat via the concat demuxer. No re-encode."""
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    concat_list = edit_dir / "_concat.txt"
-    concat_list.write_text("".join(f"file '{p.resolve()}'\n" for p in segment_paths))
+    """A/V-safe concat via the concat FILTER (one re-encode).
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "concat", "-safe", "0",
-        "-i", str(concat_list),
-        "-c", "copy",
+    Why not the concat *demuxer* with `-c copy`: each segment is independently
+    encoded, so its muxed audio and video streams differ slightly in duration
+    (AAC frames are 1024 samples; x264 GOPs don't align to that). The demuxer
+    copies streams verbatim and stitches them by container edit lists, and on the
+    FINAL segment that mismatch surfaces as video ending ~0.5-0.7s BEFORE audio —
+    the last spoken word / final overlay card gets chopped while the audio plays
+    on. (Caught on the AI-companions cut: `-c copy` gave vdur≈60.7 adur≈61.4.)
+
+    The concat filter decodes every stream and re-times the whole timeline onto a
+    single clock, so [v] and [a] end together (measured ±0.02s). Cost is one extra
+    near-transparent generation (CRF 16) on this intermediate base — which the
+    final composite re-encode (CRF 17) would incur regardless. All segments share
+    format/res/fps/samplerate (extract_segment enforces it), so the filter's
+    equal-streams requirement holds.
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    n = len(segment_paths)
+    if n == 0:
+        raise ValueError("concat_segments: no segments to concat")
+    fps = source_fps(segment_paths[0])
+
+    cmd: list[str] = ["ffmpeg", "-y"]
+    for p in segment_paths:
+        cmd += ["-i", str(p)]
+    streams = "".join(f"[{i}:v][{i}:a]" for i in range(n))
+    filter_complex = f"{streams}concat=n={n}:v=1:a=1[v][a]"
+    cmd += [
+        "-filter_complex", filter_complex,
+        "-map", "[v]", "-map", "[a]",
+        "-c:v", "libx264", "-preset", "medium", "-crf", "16",
+        "-pix_fmt", "yuv420p", "-r", f"{fps:.6g}",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
         "-movflags", "+faststart",
         str(out_path),
     ]
-    print(f"concat → {out_path.name}")
+    print(f"concat (filter, A/V-safe) → {out_path.name}")
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    concat_list.unlink(missing_ok=True)
+
+    # A/V parity gate — the whole point of this function. Fail loud if the tail drifted.
+    def _dur(path: Path, stream: str) -> float:
+        try:
+            out = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", stream,
+                 "-show_entries", "stream=duration", "-of",
+                 "default=noprint_wrappers=1:nokey=1", str(path)],
+                capture_output=True, text=True, check=True,
+            )
+            return float(out.stdout.strip().splitlines()[0])
+        except Exception:
+            return -1.0
+
+    vdur, adur = _dur(out_path, "v:0"), _dur(out_path, "a:0")
+    if vdur > 0 and adur > 0:
+        skew = abs(vdur - adur)
+        print(f"  A/V parity: vdur={vdur:.3f} adur={adur:.3f} skew={skew:+.3f}s")
+        if skew > 0.10:
+            raise RuntimeError(
+                f"concat A/V skew {skew:.3f}s exceeds 0.10s — tail likely dropped. "
+                f"vdur={vdur:.3f} adur={adur:.3f}. Refusing to hand off a drifted base."
+            )
 
 
 # -------- Master SRT (Rule 5) ------------------------------------------------
@@ -508,7 +588,9 @@ def build_final_composite(
     has_subs = subtitles_path is not None and subtitles_path.exists()
 
     if not has_overlays and not has_subs:
-        # Nothing to do — just rename/copy base to final name
+        # Nothing to do — just copy base to final name (unless it's already that file)
+        if base_path.resolve() == out_path.resolve():
+            return
         run(["ffmpeg", "-y", "-i", str(base_path), "-c", "copy", str(out_path)], quiet=True)
         return
 
@@ -558,7 +640,7 @@ def build_final_composite(
         "-filter_complex", filter_complex,
         "-map", out_label,
         "-map", "0:a",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        "-c:v", "libx264", "-preset", "slow", "-crf", "17",
         "-pix_fmt", "yuv420p",
         "-c:a", "copy",
         "-movflags", "+faststart",
